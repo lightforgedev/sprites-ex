@@ -197,4 +197,94 @@ defmodule Sprites.CommandTest do
       overrides
     )
   end
+
+  describe "crash-report redaction" do
+    @canary "stdin-canary-secret"
+    @token "token-canary-secret"
+
+    for sensitive <- [true, false] do
+      test "a failing stdin write replies an error, keeps the process alive and logs nothing (sensitive=#{sensitive})" do
+        sensitive = unquote(sensitive)
+
+        log =
+          ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+            # Invalid mode: encode_stdin would raise FunctionClauseError with
+            # the stdin bytes in its stacktrace arguments.
+            state =
+              command_state(%{
+                sensitive: sensitive,
+                tty_mode: :bad,
+                conn: :not_a_conn,
+                stream_ref: make_ref(),
+                token: @token,
+                sprite: Sprite.new(Sprites.new(@token), "crash-test")
+              })
+
+            {:ok, pid} = :proc_lib.start(__MODULE__, :run_command_loop, [state, self()])
+
+            assert {:error, :write_failed} = GenServer.call(pid, {:write_stdin, @canary})
+            assert Process.alive?(pid)
+            Process.exit(pid, :kill)
+            Process.sleep(50)
+          end)
+
+        refute log =~ @canary
+        refute log =~ @token
+      end
+    end
+
+    test "a killed command process reports no stdin or token" do
+      state = command_state(%{sensitive: true, token: @token, tty_mode: false})
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+          {:ok, pid} = :proc_lib.start(__MODULE__, :run_command_loop, [state, self()])
+          assert {:error, :not_connected} = GenServer.call(pid, {:write_stdin, @canary})
+          Process.exit(pid, :kill)
+          Process.sleep(50)
+        end)
+
+      refute log =~ @canary
+      refute log =~ @token
+    end
+
+    test "sensitive mode hides process info and status" do
+      state = command_state(%{sensitive: true, token: @token})
+      {:ok, pid} = :proc_lib.start(__MODULE__, :run_command_loop, [state, self()])
+      status = :sys.get_status(pid)
+      refute inspect(status, limit: :infinity) =~ @token
+      Process.exit(pid, :kill)
+    end
+
+    test "format_status redacts state, message and reason in sensitive mode" do
+      status =
+        Command.format_status(%{
+          state: command_state(%{sensitive: true, token: @token}),
+          message: {:other, @canary},
+          reason: {:function_clause, [{Foo, :bar, [@canary], []}]}
+        })
+
+      refute inspect(status, limit: :infinity) =~ @canary
+      refute inspect(status, limit: :infinity) =~ @token
+    end
+
+    test "format_status redacts stdin messages and token in default mode" do
+      status =
+        Command.format_status(%{
+          state: command_state(%{token: @token}),
+          message: {:write_stdin, @canary},
+          reason: :boom
+        })
+
+      refute inspect(status) =~ @canary
+      refute inspect(status) =~ @token
+      assert status.reason == :boom
+    end
+  end
+
+  @doc false
+  def run_command_loop(state, _parent) do
+    :proc_lib.init_ack({:ok, self()})
+    :gen_server.enter_loop(Command, [], state)
+  end
 end

@@ -60,6 +60,19 @@ defmodule Sprites.ControlConn do
   end
 
   @doc """
+  Sends stdin through the control connection and reports the real dispatch
+  result. Unlike `send_data/2` this is a call, so a failed write is returned as
+  `{:error, :write_failed}` and can never crash this process or put the bytes
+  in a crash report.
+  """
+  @spec write_stdin(pid(), binary()) :: :ok | {:error, :write_failed}
+  def write_stdin(pid, frame) do
+    GenServer.call(pid, {:write_stdin, frame})
+  catch
+    _kind, _reason -> {:error, :write_failed}
+  end
+
+  @doc """
   Sends a text frame through the control connection.
   """
   @spec send_text(pid(), String.t()) :: :ok
@@ -87,6 +100,9 @@ defmodule Sprites.ControlConn do
 
   @impl true
   def init(opts) do
+    # First, before this process reads the token or accepts stdin.
+    Process.flag(:sensitive, true)
+
     url = Keyword.fetch!(opts, :url)
     token = Keyword.fetch!(opts, :token)
 
@@ -127,6 +143,22 @@ defmodule Sprites.ControlConn do
       :gun.ws_send(state.conn, state.stream_ref, {:text, frame})
       {:reply, :ok, %{state | owner: owner, op_active: true}}
     end
+  end
+
+  def handle_call({:write_stdin, frame}, _from, %{conn: conn, stream_ref: stream_ref} = state) do
+    reply =
+      try do
+        case :gun.ws_send(conn, stream_ref, {:binary, frame}) do
+          {:error, _reason} -> {:error, :write_failed}
+          _ok -> :ok
+        end
+      rescue
+        _exception -> {:error, :write_failed}
+      catch
+        _kind, _reason -> {:error, :write_failed}
+      end
+
+    {:reply, reply, state}
   end
 
   @impl true
@@ -214,6 +246,24 @@ defmodule Sprites.ControlConn do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  # Stdin frames and sent data never appear in crash reports; the connection
+  # state holds no token (it is only used while connecting).
+  @impl true
+  def format_status(status) do
+    status
+    |> redact_key(:message, &redact_message/1)
+    |> redact_key(:reason, fn _reason -> :redacted end)
+  end
+
+  defp redact_key(status, key, fun) do
+    if Map.has_key?(status, key), do: Map.update!(status, key, fun), else: status
+  end
+
+  defp redact_message({:write_stdin, _frame}), do: {:write_stdin, :redacted}
+  defp redact_message({:send_data, _data}), do: {:send_data, :redacted}
+  defp redact_message({:send_text, _text}), do: {:send_text, :redacted}
+  defp redact_message(message), do: message
 
   # Private helpers
 

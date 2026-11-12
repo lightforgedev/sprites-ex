@@ -128,11 +128,16 @@ defmodule Sprites.Command do
 
   @impl true
   def init(%{sprite: sprite, command: command, args: args, opts: opts, owner: owner, ref: ref}) do
+    sensitive = Keyword.get(opts, :sensitive, false) == true
+    # First, before this process holds the token or accepts stdin.
+    if sensitive, do: Process.flag(:sensitive, true)
+
     tty_mode = Keyword.get(opts, :tty, false)
     token = Sprite.token(sprite)
     stdin = Keyword.get(opts, :stdin, false)
 
     base_state = %{
+      sensitive: sensitive,
       owner: owner,
       ref: ref,
       tty_mode: tty_mode,
@@ -387,9 +392,10 @@ defmodule Sprites.Command do
         %{using_control: true, control_conn: conn_pid, tty_mode: tty_mode} = state
       )
       when conn_pid != nil do
-    frame_data = Protocol.encode_stdin(data, tty_mode)
-    ControlConn.send_data(conn_pid, frame_data)
-    {:reply, :ok, state}
+    reply =
+      send_stdin(data, tty_mode, fn frame -> ControlConn.write_stdin(conn_pid, frame) end)
+
+    {:reply, reply, state}
   end
 
   def handle_call(
@@ -398,13 +404,28 @@ defmodule Sprites.Command do
         %{conn: conn, stream_ref: stream_ref, tty_mode: tty_mode} = state
       )
       when conn != nil do
-    frame_data = Protocol.encode_stdin(data, tty_mode)
-    :gun.ws_send(conn, stream_ref, {:binary, frame_data})
-    {:reply, :ok, state}
+    reply =
+      send_stdin(data, tty_mode, fn frame -> :gun.ws_send(conn, stream_ref, {:binary, frame}) end)
+
+    {:reply, reply, state}
   end
 
   def handle_call({:write_stdin, _data}, _from, state) do
     {:reply, {:error, :not_connected}, state}
+  end
+
+  # Stdin may be a secret. A failure here must never crash this process: a
+  # FunctionClauseError or exit stacktrace carries its arguments (the stdin
+  # bytes) into the crash report, where `format_status/1` cannot reach.
+  defp send_stdin(data, tty_mode, send_fun) do
+    case send_fun.(Protocol.encode_stdin(data, tty_mode)) do
+      {:error, _reason} -> {:error, :write_failed}
+      _ok -> :ok
+    end
+  rescue
+    _exception -> {:error, :write_failed}
+  catch
+    _kind, _reason -> {:error, :write_failed}
   end
 
   # --- Close stdin ---
@@ -452,6 +473,40 @@ defmodule Sprites.Command do
   end
 
   def handle_cast({:resize, _, _}, state), do: {:noreply, state}
+
+  # --- Crash-report redaction ---
+
+  # The provider token is always redacted, and stdin writes are never shown in
+  # a "last message". With `sensitive: true` the whole state, message and exit
+  # reason are redacted: a reason can carry stacktrace arguments that include
+  # the stdin frame.
+  @impl true
+  def format_status(status) do
+    sensitive = sensitive_state?(Map.get(status, :state))
+
+    status
+    |> Map.update(:state, nil, &redact_state(&1, sensitive))
+    |> redact_key(:message, &redact_message(&1, sensitive))
+    |> redact_key(:reason, fn reason -> if sensitive, do: :redacted, else: reason end)
+  end
+
+  defp sensitive_state?(%{sensitive: true}), do: true
+  defp sensitive_state?(_state), do: false
+
+  defp redact_key(status, key, fun) do
+    if Map.has_key?(status, key), do: Map.update!(status, key, fun), else: status
+  end
+
+  defp redact_state(_state, true), do: :redacted
+
+  defp redact_state(%{} = state, false),
+    do: state |> Map.replace(:token, :redacted) |> Map.replace(:sprite, :redacted)
+
+  defp redact_state(state, false), do: state
+
+  defp redact_message(_message, true), do: :redacted
+  defp redact_message({:write_stdin, _data}, false), do: {:write_stdin, :redacted}
+  defp redact_message(message, false), do: message
 
   # --- Terminate ---
 
