@@ -393,7 +393,7 @@ defmodule Sprites.Command do
       )
       when conn_pid != nil do
     reply =
-      send_stdin(data, tty_mode, fn frame -> ControlConn.send_data(conn_pid, frame) end)
+      send_stdin(data, tty_mode, fn frame -> ControlConn.write_stdin(conn_pid, frame) end)
 
     {:reply, reply, state}
   end
@@ -418,8 +418,10 @@ defmodule Sprites.Command do
   # FunctionClauseError or exit stacktrace carries its arguments (the stdin
   # bytes) into the crash report, where `format_status/1` cannot reach.
   defp send_stdin(data, tty_mode, send_fun) do
-    send_fun.(Protocol.encode_stdin(data, tty_mode))
-    :ok
+    case send_fun.(Protocol.encode_stdin(data, tty_mode)) do
+      {:error, _reason} -> {:error, :write_failed}
+      _ok -> :ok
+    end
   rescue
     _exception -> {:error, :write_failed}
   catch
