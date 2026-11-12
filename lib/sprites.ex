@@ -143,6 +143,10 @@ defmodule Sprites do
     * `:tty` - Allocate a TTY (default: false)
     * `:tty_rows` - TTY rows (default: 24)
     * `:tty_cols` - TTY columns (default: 80)
+    * `:sensitive` - Redact this command process from crash reports and
+      `:sys` status, and disable tracing and `Process.info/2` introspection
+      (default: false). Use when writing secrets to stdin. The provider token
+      and stdin writes are redacted from crash reports in every mode.
     * `:session_info` - Report provider session identity to the owner as
       `{:session_info, %{ref: ref}, session_id}` (default: false). The ID is a
       string. Missing metadata yields no identity; it is never inferred from
